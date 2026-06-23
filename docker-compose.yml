@@ -1,0 +1,80 @@
+# docker-compose.yml — Phase 3: infrastructure only (Postgres, Redis, MinIO).
+# App services (api/worker/migrate) are added in Phase 8.
+# Windows-friendly: NAMED VOLUMES only (no bind mounts), repo path may contain spaces.
+name: aie  # project name -> deterministic container/volume prefixes (compose v2)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${AIE_POSTGRES_USER:-aie}
+      POSTGRES_PASSWORD: ${AIE_POSTGRES_PASSWORD:-aie}
+      POSTGRES_DB: ${AIE_POSTGRES_DB:-aie}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready returns 0 only when the server accepts connections.
+      test: ["CMD-SHELL", "pg_isready -U ${AIE_POSTGRES_USER:-aie} -d ${AIE_POSTGRES_DB:-aie}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # appendonly yes => durable streams across restarts (matters for Phase 5 broker).
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]   # expects "PONG"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${AIE_OBJECT_STORE__ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AIE_OBJECT_STORE__SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API   (boto3 endpoint_url -> http://localhost:9000)
+      - "9001:9001"   # web console
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      # MinIO ships a liveness endpoint; curl is present in the minio image.
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot job: wait for MinIO, then create the application bucket and exit.
+  # Re-runnable: `mc mb -p` is idempotent (no error if the bucket already exists).
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${AIE_OBJECT_STORE__ACCESS_KEY_ID:-minioadmin} ${AIE_OBJECT_STORE__SECRET_ACCESS_KEY:-minioadmin} &&
+      mc mb -p local/${AIE_OBJECT_STORE__BUCKET:-aie-artifacts} &&
+      echo 'bucket ready: ${AIE_OBJECT_STORE__BUCKET:-aie-artifacts}'
+      "
+    restart: "no"
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
