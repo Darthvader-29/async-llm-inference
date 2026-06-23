@@ -11,7 +11,31 @@ from collections.abc import Iterator
 
 import pytest
 
-from app.core.config import Environment, Settings, get_settings
+from app.core.config import Environment, RetrySettings, Settings, get_settings
+from tests.support.offloader import RecordingOffloader
+
+
+@pytest.fixture
+def recording_offloader() -> RecordingOffloader:
+    """A fresh recording spy per test (no shared state across tests)."""
+    return RecordingOffloader()
+
+
+@pytest.fixture
+def retry_settings() -> RetrySettings:
+    """Zero-delay retry config so attempt-counting tests run instantly.
+
+    ``base_delay_s=0`` and ``jitter_s=0`` make ``wait_exponential_jitter``
+    collapse to ~0s — we never sleep meaningfully, yet exercise the real wait
+    object. ``max_attempts=3`` is the count tests assert against.
+    """
+    return RetrySettings(
+        max_attempts=3,
+        base_delay_s=0.0,
+        max_delay_s=0.0,
+        exp_base=2.0,
+        jitter_s=0.0,
+    )
 
 
 @pytest.fixture
