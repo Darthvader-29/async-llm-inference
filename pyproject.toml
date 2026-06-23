@@ -1,0 +1,152 @@
+# =============================================================================
+# pyproject.toml — Asynchronous AI Serving Engine
+# Build backend: hatchling.  Managed by: uv.  Python: 3.12+.
+# =============================================================================
+
+[project]
+name = "async-ai-engine"
+version = "0.1.0"
+description = "Asynchronous AI Serving Engine — Hexagonal, non-blocking, zero-cloud-by-default."
+readme = "README.md"
+requires-python = ">=3.12"          # StrEnum, modern typing, PEP 695-friendly
+license = { text = "MIT" }
+authors = [{ name = "Atharva Kanawade" }]
+
+# --- Runtime dependencies (the full closure used across all 9 phases) --------
+# Versions use lower bounds; uv pins exact versions in uv.lock for reproducibility.
+dependencies = [
+    "fastapi>=0.115",               # API layer (Phase 6)
+    "uvicorn[standard]>=0.32",      # ASGI server; [standard] pulls uvloop on Linux only
+    "pydantic>=2.9",                # domain-adjacent validation (schemas, Phase 6)
+    "pydantic-settings>=2.5",       # Settings(BaseSettings) — THIS phase
+    "sqlalchemy[asyncio]>=2.0.36",  # async ORM core (Phase 3)
+    "asyncpg>=0.30",                # async Postgres driver (works on Windows Proactor loop)
+    "alembic>=1.14",                # async migrations (Phase 3)
+    "redis>=5.2",                   # redis-py with asyncio + Streams (Phase 5)
+    "boto3>=1.35",                  # S3/MinIO client (Phase 4) — points at MinIO, never real AWS
+    "tenacity>=9.0",                # retry/backoff (Phase 2)
+    "structlog>=24.4",              # structured logging — THIS phase
+    "huggingface-hub>=0.26",        # real LLM/embedding adapter (Phase 4)
+    "pinecone>=5.3",                # real vector store adapter (Phase 4)
+    "ddgs>=6.0",                    # real search adapter (Phase 4)
+]
+
+# --- Console entry points ----------------------------------------------------
+# Lets `uv run aie-worker` launch the worker once Phase 7 lands.
+[project.scripts]
+aie-worker = "app.worker.__main__:main"
+
+# --- Dev dependencies (PEP 735 dependency groups; installed by `uv sync`) ----
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",         # asyncio_mode = "auto"
+    "pytest-cov>=6.0",
+    "httpx>=0.27",                  # ASGI test client (Phase 6)
+    "asgi-lifespan>=2.1",           # drive lifespan in tests (Phase 6)
+    "fakeredis>=2.26",              # in-memory Redis for unit tests (Phase 5)
+    "aiosqlite>=0.20",              # in-memory async SQL for repo unit tests (Phase 3)
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "boto3-stubs[s3]>=1.35",        # typing for boto3 S3 calls (Phase 4)
+    "poethepoet>=0.30",             # task runner
+]
+
+# --- Build backend (src layout) ----------------------------------------------
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]              # the importable package lives under src/
+
+# =============================================================================
+# Ruff — linter + formatter (replaces black/isort/flake8)
+# =============================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]              # first-party roots for import sorting
+extend-exclude = ["migrations"]    # Alembic-generated files (Phase 3)
+
+[tool.ruff.lint]
+# A pragmatic, strict-leaning selection. Codes:
+#   E,W  pycodestyle   F   pyflakes      I   isort        N   pep8-naming
+#   UP   pyupgrade     B   bugbear       C4  comprehensions
+#   SIM  simplify      RUF ruff-specific TID banned/relative imports
+#   ASYNC async-specific lints (blocking calls in async fns)
+select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "TID", "ASYNC"]
+ignore = [
+    "E501",   # line length is enforced by the formatter, not the linter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may use assert and re-import fixtures; allow it.
+"tests/**" = ["S101"]
+"**/__init__.py" = ["F401"]        # re-exports in package __init__ are intentional
+# Domain exception names (InvalidTransition, JobNotFound) are intentionally
+# suffix-less — they are LOCKED in Docs/phases/_CONTRACTS.md and consumed by
+# Phases 3/5/6. Suppress N818's "should end in Error" here rather than rename.
+"src/app/domain/exceptions.py" = ["N818"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"       # force absolute imports → clearer hexagon boundaries
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"                 # CRITICAL on Windows: never emit CRLF (see §11)
+skip-magic-trailing-comma = false
+
+# =============================================================================
+# Mypy — strict static typing, with the pydantic plugin
+# =============================================================================
+[tool.mypy]
+python_version = "3.12"
+strict = true                      # turns on the full strict bundle (see notes below)
+plugins = ["pydantic.mypy"]        # understands BaseModel/BaseSettings __init__ signatures
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+no_implicit_reexport = true
+files = ["src", "tests"]
+
+# Third-party libs that ship no type stubs → don't fail the build on them.
+[[tool.mypy.overrides]]
+module = ["ddgs.*", "pinecone.*", "fakeredis.*"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true           # error on unknown kwargs to a model constructor
+init_typed = true                  # use real field types in synthesized __init__
+warn_required_dynamic_aliases = true
+
+# =============================================================================
+# Pytest — asyncio auto mode + the `integration` marker
+# =============================================================================
+[tool.pytest.ini_options]
+asyncio_mode = "auto"              # async test fns auto-marked; no decorator boilerplate
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"   # strict-markers: typo'd markers are errors
+markers = [
+    "integration: tests that require live infra (Postgres/Redis/MinIO). Deselect with -m 'not integration'.",
+]
+
+# =============================================================================
+# Poe the Poet — the project's task vocabulary (one command per phase verify)
+# =============================================================================
+[tool.poe.tasks]
+fmt        = "ruff format ."
+lint       = "ruff check ."
+typecheck  = "mypy src tests"
+test       = "pytest -m 'not integration'"
+test-int   = "pytest -m integration"
+# `check` is the main gate every PR must pass — used by CI (Phase 9) and locally.
+check      = ["fmt", "lint", "typecheck", "test"]
+api        = "uvicorn app.api.app:create_app --factory --reload --port 8000"
+worker     = "python -m app.worker"
+up         = "docker compose up -d postgres redis minio"
+down       = "docker compose down"
+migrate    = "alembic upgrade head"
+smoke      = "pwsh -File scripts/smoke.ps1"

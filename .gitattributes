@@ -1,0 +1,11 @@
+# Normalize all text files to LF in the repository.
+# `text=auto` lets Git decide what is text; `eol=lf` forces the stored EOL.
+* text=auto eol=lf
+
+# Explicitly mark binaries so Git never tries to normalize them.
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.whl  binary
