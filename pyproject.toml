@@ -84,6 +84,9 @@ ignore = [
 # Tests may use assert and re-import fixtures; allow it.
 "tests/**" = ["S101"]
 "**/__init__.py" = ["F401"]        # re-exports in package __init__ are intentional
+# The adapter-test stubs mimic boto3's PascalCase keyword API (Bucket/Key/Body/
+# ContentType) on purpose, so the real adapter code path runs unchanged.
+"tests/unit/adapters/conftest.py" = ["N803"]
 # Domain exception names (InvalidTransition, JobNotFound) are intentionally
 # suffix-less — they are LOCKED in Docs/phases/_CONTRACTS.md and consumed by
 # Phases 3/5/6. Suppress N818's "should end in Error" here rather than rename.
