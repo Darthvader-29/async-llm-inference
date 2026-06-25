@@ -1,0 +1,54 @@
+# =============================================================================
+# .dockerignore — shrink & stabilize the build context.
+# Everything here is EXCLUDED from what Docker sends to the daemon. A lean
+# context speeds uploads, prevents secret leakage (.env), and stops local
+# artifacts from invalidating layers or bloating the image.
+# =============================================================================
+
+# --- Version control & CI ---------------------------------------------------
+.git
+.github
+.gitignore
+.gitattributes
+
+# --- Local virtual environments & Python caches -----------------------------
+.venv
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# --- Secrets & local env (NEVER ship these into an image layer) -------------
+.env
+.env.*
+!.env.example
+# ^ The leading ! re-includes .env.example; every other .env.* (real secrets)
+#   stays excluded.
+
+# --- Docs, IDE, OS cruft ----------------------------------------------------
+Docs/
+*.md
+!README.md
+# ^ README.md is re-included: pyproject's `readme = "README.md"` needs it at
+#   build time (the Dockerfile COPYs it for the hatchling build).
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Docker meta (avoid recursive/irrelevant context) -----------------------
+docker-compose*.yml
+.dockerignore
+docker/
+
+# --- Tests (not needed at runtime; --no-dev already drops the test deps) -----
+tests/
+
+# --- Scripts (manual demo; runs on the host, not inside the image) ----------
+scripts/

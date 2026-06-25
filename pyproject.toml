@@ -137,22 +137,38 @@ markers = [
 ]
 
 # =============================================================================
-# Poe the Poet — the project's task vocabulary (one command per phase verify)
+# Poe the Poet — the project's task vocabulary. Run with `uv run poe <task>`;
+# list everything with `uv run poe --help`. This catalog is the single source of
+# truth for "how do I run X", invoked identically by a developer and by CI.
 # =============================================================================
 [tool.poe.tasks]
-fmt        = "ruff format ."
-lint       = "ruff check ."
-typecheck  = "mypy src tests"
-test       = "pytest -m 'not integration'"
-test-int   = "pytest -m integration"
-# `check` is the main gate every PR must pass — used by CI (Phase 9) and locally.
-check      = ["fmt", "lint", "typecheck", "test"]
-api        = "uvicorn app.api.app:create_app --factory --reload --port 8000"
-worker     = "python -m app.worker"
-up         = "docker compose up -d"
-down       = "docker compose down"
-down-v     = "docker compose down -v"
-migrate    = "alembic upgrade head"
-downgrade  = "alembic downgrade -1"
-revision   = "alembic revision --autogenerate -m"
-smoke      = "pwsh -File scripts/smoke.ps1"
+
+# --- Code quality -----------------------------------------------------------
+fmt        = { cmd = "ruff format .",          help = "Auto-format all code (rewrites files)" }
+fmt-check  = { cmd = "ruff format --check .",   help = "Verify formatting without rewriting (CI gate)" }
+lint       = { cmd = "ruff check .",            help = "Lint with ruff (rules from [tool.ruff])" }
+lint-fix   = { cmd = "ruff check --fix .",      help = "Lint and auto-apply safe fixes" }
+typecheck  = { cmd = "mypy src tests",          help = "Strict static type checking (mypy --strict)" }
+
+# --- Tests ------------------------------------------------------------------
+test       = { cmd = "pytest -m 'not integration' --cov=app --cov-report=xml --cov-report=term-missing", help = "Fast suite (no infra): fakes + fakeredis + aiosqlite" }
+test-int   = { cmd = "pytest -m integration",   help = "Integration suite (needs postgres/redis/minio)" }
+test-all   = { cmd = "pytest --cov=app",        help = "Entire suite (fast + integration)" }
+
+# --- Aggregate gate: the LOCAL mirror of the CI `quality` job ----------------
+# Explicit `ref` items so each entry is unambiguously a task reference (not a
+# shell command), independent of poe's default array-item type.
+check      = { sequence = [{ ref = "lint" }, { ref = "fmt-check" }, { ref = "typecheck" }, { ref = "test" }], help = "Run the full quality gate locally (mirrors the CI `quality` job)" }
+
+# --- Run the application ----------------------------------------------------
+api        = { cmd = "uvicorn app.api.app:create_app --factory --reload --port 8000", help = "Run the FastAPI ingestion API (dev, with reload)" }
+worker     = { cmd = "python -m app.worker",    help = "Run the async background worker" }
+
+# --- Infrastructure & ops ---------------------------------------------------
+up         = { cmd = "docker compose up -d postgres redis minio createbuckets", help = "Start infrastructure only (Postgres, Redis, MinIO) + provision the bucket" }
+down       = { cmd = "docker compose down",      help = "Stop all containers (keeps named volumes / data)" }
+down-v     = { cmd = "docker compose down -v",   help = "Stop containers AND delete named volumes (wipes data)" }
+migrate    = { cmd = "alembic upgrade head",     help = "Apply all database migrations to the latest revision" }
+downgrade  = { cmd = "alembic downgrade -1",     help = "Revert the most recent migration" }
+revision   = { cmd = "alembic revision --autogenerate -m", help = "Autogenerate a new migration (append a -m message)" }
+smoke      = { cmd = "pwsh -File scripts/smoke.ps1", help = "End-to-end happy-path smoke demo (POST a job, poll to terminal)" }

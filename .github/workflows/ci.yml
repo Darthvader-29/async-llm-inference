@@ -1,0 +1,195 @@
+# .github/workflows/ci.yml
+# Continuous Integration for the Asynchronous AI Serving Engine.
+#
+# Two jobs (run in parallel):
+#   quality      — lint + typecheck + fast tests (NO infrastructure).
+#   integration  — real adapters against postgres/redis/minio.
+#
+# Both install uv via the first-party astral-sh/setup-uv action (cached on
+# uv.lock) and route every command through `uv run poe <task>` so CI executes the
+# exact commands a developer runs locally — no inline command drift.
+name: CI
+
+# Run on every push to main and on every pull request targeting main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-flight run when a newer commit is pushed to the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Principle of least privilege: the workflow only needs to read the repo.
+permissions:
+  contents: read
+
+# Pin the Python version once; both jobs reference it. Matches requires-python >= 3.12.
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1 — quality: zero-infrastructure gate. Runs in seconds on every push.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Quality (lint - types - fast tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Install uv and enable its built-in dependency cache (keyed on uv.lock).
+      - name: Install uv (cached)
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Create the project virtualenv from the EXACT committed lockfile.
+      # --frozen fails loudly if uv.lock is stale vs pyproject.toml.
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras --dev
+
+      # Lint without modifying files. `poe lint` == `ruff check .`
+      - name: Ruff lint
+        run: uv run poe lint
+
+      # Verify formatting without rewriting. `poe fmt-check` == `ruff format --check .`
+      - name: Ruff format check
+        run: uv run poe fmt-check
+
+      # Strict static typing. `poe typecheck` == `mypy src tests`
+      - name: Mypy (strict)
+        run: uv run poe typecheck
+
+      # Fast test suite only — everything NOT marked `integration`.
+      # Needs no Docker: fakes + fakeredis + aiosqlite (Phases 2/3/4/5).
+      - name: Pytest (fast, with coverage)
+        run: uv run poe test
+
+      # Publish the coverage report as a build artifact for inspection.
+      - name: Upload coverage report
+        if: always()   # upload even if tests failed, so failures are diagnosable
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 — integration: real adapters against real infrastructure.
+  # The job runs DIRECTLY ON THE RUNNER, so services are reached via localhost
+  # on their mapped host ports.
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Integration (postgres - redis - minio)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Postgres and Redis ship health probes (pg_isready / redis-cli), so the
+    # runner waits for `healthy` before steps run. MinIO is started as a step
+    # below (its image needs a `server /data` subcommand the service short-form
+    # cannot supply).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aie
+          POSTGRES_PASSWORD: aie
+          POSTGRES_DB: aie
+        ports:
+          - 5432:5432   # HOST:CONTAINER — reachable at localhost:5432 on the runner
+        options: >-
+          --health-cmd "pg_isready -U aie -d aie"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    # Environment for ALL steps. Adapters read AIE_*-prefixed settings.
+    # Hosts are localhost because the job runs on the runner, not in a container.
+    # Names match src/app/core/config.py exactly (nested groups use `__`).
+    env:
+      AIE_ENV: test
+      AIE_DATABASE_URL: postgresql+asyncpg://aie:aie@localhost:5432/aie
+      AIE_REDIS_URL: redis://localhost:6379/0
+      AIE_OBJECT_STORE__ENDPOINT_URL: http://localhost:9000
+      AIE_OBJECT_STORE__ACCESS_KEY_ID: minioadmin
+      AIE_OBJECT_STORE__SECRET_ACCESS_KEY: minioadmin
+      AIE_OBJECT_STORE__BUCKET: aie-artifacts
+      AIE_OBJECT_STORE__FORCE_PATH_STYLE: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv (cached)
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras --dev
+
+      # MinIO cannot run from `services:` — the minio/minio image needs a
+      # `server /data` subcommand that the service short-form cannot supply.
+      # Start it as a step where we control the full command line.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data --console-address ":9001"
+
+      # MinIO ships no health-probe binary the runner can wait on, but the runner
+      # host DOES have curl — poll the documented liveness endpoint until 200.
+      - name: Wait for MinIO to be ready
+        run: |
+          echo "Polling MinIO liveness endpoint http://localhost:9000/minio/health/live"
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://localhost:9000/minio/health/live; then
+              echo "MinIO is live (attempt ${attempt})."
+              exit 0
+            fi
+            echo "MinIO not ready yet (attempt ${attempt}); sleeping 2s..."
+            sleep 2
+          done
+          echo "::error::MinIO did not become ready within 60s"
+          exit 1
+
+      # Provision the artifacts bucket so the integration tests have a target.
+      - name: Create MinIO bucket
+        run: |
+          docker run --rm --network host \
+            --entrypoint /bin/sh minio/mc:latest -c '
+              mc alias set local http://localhost:9000 minioadmin minioadmin &&
+              mc mb --ignore-existing local/aie-artifacts &&
+              mc ls local
+            '
+
+      # Apply all Alembic migrations to the fresh Postgres service.
+      # `poe migrate` == `alembic upgrade head` (reads AIE_DATABASE_URL).
+      - name: Run database migrations
+        run: uv run poe migrate
+
+      # Integration suite ONLY — everything marked `integration`.
+      # `poe test-int` == `pytest -m integration`
+      - name: Pytest (integration)
+        run: uv run poe test-int

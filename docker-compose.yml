@@ -1,9 +1,50 @@
-# docker-compose.yml — Phase 3: infrastructure only (Postgres, Redis, MinIO).
-# App services (api/worker/migrate) are added in Phase 8.
-# Windows-friendly: NAMED VOLUMES only (no bind mounts), repo path may contain spaces.
+# docker-compose.yml — full-stack Asynchronous AI Serving Engine.
+# Phase 3 delivered infra only (postgres/redis/minio + bucket init); Phase 8
+# extends it with the one-shot `migrate` service and the long-running `api` and
+# `worker` services, all built from the SAME multi-stage image (docker/Dockerfile).
+#
+# Compose v2 (the `docker compose` plugin). No top-level `version:` key — it is
+# obsolete in v2 and emits a deprecation warning if present.
+# Windows-friendly: NAMED VOLUMES only (no bind mounts); the repo path may
+# contain spaces ("Study supply").
 name: aie  # project name -> deterministic container/volume prefixes (compose v2)
 
+# =============================================================================
+# YAML anchors — DRY up the repeated build block and env so migrate/api/worker
+# all reference the SAME image and the SAME in-network configuration.
+# =============================================================================
+x-app-build: &app-build
+  context: .                      # build context = repo root (sees pyproject/uv.lock/src)
+  dockerfile: docker/Dockerfile   # Dockerfile lives under docker/
+
+# Shared environment for every app container. These OVERRIDE the Settings()
+# host defaults so services talk to each other by compose service name.
+# Env-var NAMES are the project-canonical AIE_* set (matches src/app/core/config.py
+# and the Phase 3 infra services below) — NOT bare POSTGRES_*/MINIO_ROOT_*.
+x-app-env: &app-env
+  AIE_ENV: ${AIE_ENV:-dev}
+  # Connection strings point at SERVICE NAMES (postgres/redis), not localhost:
+  AIE_DATABASE_URL: postgresql+asyncpg://${AIE_POSTGRES_USER:-aie}:${AIE_POSTGRES_PASSWORD:-aie}@postgres:5432/${AIE_POSTGRES_DB:-aie}
+  AIE_REDIS_URL: redis://redis:6379/0
+  # CRITICAL zero-cloud-in-container override: MinIO is reachable as `minio`,
+  # NOT localhost. Because the endpoint is now explicit, the Settings validator's
+  # "if no endpoint -> localhost:9000" redirect does NOT fire (it would be wrong
+  # inside a container, where localhost is the container itself).
+  AIE_OBJECT_STORE__ENDPOINT_URL: http://minio:9000
+  AIE_OBJECT_STORE__ACCESS_KEY_ID: ${AIE_OBJECT_STORE__ACCESS_KEY_ID:-minioadmin}
+  AIE_OBJECT_STORE__SECRET_ACCESS_KEY: ${AIE_OBJECT_STORE__SECRET_ACCESS_KEY:-minioadmin}
+  AIE_OBJECT_STORE__BUCKET: ${AIE_OBJECT_STORE__BUCKET:-aie-artifacts}
+  AIE_OBJECT_STORE__REGION: ${AIE_OBJECT_STORE__REGION:-us-east-1}
+  AIE_API_KEYS: ${AIE_API_KEYS:-local-dev-key}
+  # Provider keys are intentionally unset by default -> fake providers activate
+  # (zero cloud, zero keys). Uncomment in .env to switch to real SDK adapters.
+  AIE_HUGGINGFACE_TOKEN: ${AIE_HUGGINGFACE_TOKEN:-}
+  AIE_PINECONE_API_KEY: ${AIE_PINECONE_API_KEY:-}
+
 services:
+  # ===========================================================================
+  # Infrastructure (carried over from Phase 3, with healthchecks).
+  # ===========================================================================
   postgres:
     image: postgres:16-alpine
     environment:
@@ -46,8 +87,8 @@ services:
       MINIO_ROOT_USER: ${AIE_OBJECT_STORE__ACCESS_KEY_ID:-minioadmin}
       MINIO_ROOT_PASSWORD: ${AIE_OBJECT_STORE__SECRET_ACCESS_KEY:-minioadmin}
     ports:
-      - "9000:9000"   # S3 API   (boto3 endpoint_url -> http://localhost:9000)
-      - "9001:9001"   # web console
+      - "9000:9000"   # S3 API (host -> container), used by host tools / smoke
+      - "9001:9001"   # web console at http://localhost:9001 (manual artifact check)
     volumes:
       - miniodata:/data
     healthcheck:
@@ -59,9 +100,10 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # One-shot job: wait for MinIO, then create the application bucket and exit.
-  # Re-runnable: `mc mb -p` is idempotent (no error if the bucket already exists).
-  minio-init:
+  # One-shot: create the artifacts bucket, then EXIT 0. Runs after MinIO is healthy.
+  # `mc mb -p` is idempotent (no error if the bucket already exists) -> safe to
+  # re-run on every `up`. api/worker gate on this via service_completed_successfully.
+  createbuckets:
     image: minio/mc:latest
     depends_on:
       minio:
@@ -72,8 +114,87 @@ services:
       mc mb -p local/${AIE_OBJECT_STORE__BUCKET:-aie-artifacts} &&
       echo 'bucket ready: ${AIE_OBJECT_STORE__BUCKET:-aie-artifacts}'
       "
-    restart: "no"
+    restart: "no"     # one-shot: never restart, else service_completed_successfully never registers
 
+  # ===========================================================================
+  # Schema migration: one-shot, runs `alembic upgrade head`, then EXIT 0.
+  # api/worker gate on this via service_completed_successfully (replica-safe,
+  # idempotent: on the next `up` Alembic is a no-op at head).
+  # ===========================================================================
+  migrate:
+    build: *app-build               # SAME image as api/worker
+    image: aie-app:latest           # name it so api/worker reuse the built image
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy  # DB must accept connections before migrating
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"                   # one-shot
+
+  # ===========================================================================
+  # API: long-running uvicorn. Same image as worker; command selects the process.
+  # ===========================================================================
+  api:
+    build: *app-build
+    image: aie-app:latest
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully   # schema is current
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully   # bucket exists
+    command:
+      ["uvicorn", "app.api.app:create_app", "--factory",
+       "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"    # host:container — smoke.ps1 hits http://localhost:8000
+    healthcheck:
+      # No curl in the python:3.12-slim image -> use the bundled interpreter.
+      # Exit 0 on HTTP 200 from the liveness route, non-zero otherwise.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else sys.exit(1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s   # give the lifespan time to build AppContainer + open pools
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Worker: long-running custom Redis Streams consumer. SAME image, different CMD.
+  # ===========================================================================
+  worker:
+    build: *app-build
+    image: aie-app:latest
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    command: ["python", "-m", "app.worker"]
+    # On `docker stop`/compose down, send SIGTERM and wait up to 30s for the
+    # worker to drain in-flight jobs (Phase 7) before SIGKILL. Prevents killing
+    # a job mid-pipeline; complements at-least-once redelivery.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+# =============================================================================
+# Named volumes — managed by Docker (NOT host bind mounts). On Windows this
+# avoids path-with-space issues ("Study supply") and slow cross-FS bind mounts.
+# `docker compose down -v` removes these; plain `down` keeps them.
+# =============================================================================
 volumes:
   pgdata:
   redisdata:
