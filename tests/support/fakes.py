@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from uuid import UUID
 
+from app.domain.exceptions import JobNotFound, TransientUpstreamError
 from app.domain.models import InferenceJob
 from app.ports import SearchResult, VectorMatch
 
@@ -102,3 +103,43 @@ class StubSearchProvider:
 
     async def search(self, query: str, *, max_results: int) -> list[SearchResult]:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 additions — behaviour-rich fakes for the ingestion write-path tests.
+# Public attributes (``store`` / ``published``) so tests can assert on what was
+# persisted/published; ``get`` raises ``JobNotFound`` (the real port contract);
+# ``FakeQueue`` can be told to fail transiently N times to exercise publish
+# retry deterministically (no clocks).
+# ---------------------------------------------------------------------------
+class FakeQueue:
+    """Records published jobs; can be told to fail transiently N times."""
+
+    def __init__(self, fail_times: int = 0) -> None:
+        self.published: list[InferenceJob] = []
+        self._fail_times = fail_times
+
+    async def publish(self, job: InferenceJob) -> None:
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            raise TransientUpstreamError("simulated transient publish failure")
+        self.published.append(job)
+
+
+class InMemoryRepository:
+    """Dict-backed ``JobRepository`` (``get`` raises ``JobNotFound``)."""
+
+    def __init__(self) -> None:
+        self.store: dict[UUID, InferenceJob] = {}
+
+    async def add(self, job: InferenceJob) -> None:
+        self.store[job.id] = job
+
+    async def get(self, job_id: UUID) -> InferenceJob:
+        try:
+            return self.store[job_id]
+        except KeyError:
+            raise JobNotFound(job_id) from None
+
+    async def update(self, job: InferenceJob) -> None:
+        self.store[job.id] = job

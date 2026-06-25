@@ -226,7 +226,7 @@ flowchart LR
 Resources have dependencies: the executor backs `to_thread` calls that adapters may still be running; Redis connections may be mid-flight; the engine's pool holds sockets. Closing in *construction* order risks closing a dependency out from under an in-flight user. Reverse order — **executor → redis → engine** — drains the highest-level consumer first. `aclose()` is also written to be *idempotent and best-effort*: each teardown step is guarded so one failure doesn't strand the rest (a leaked socket is worse than a logged warning).
 
 > [!IMPORTANT]
-> `loop.set_default_executor()` changes a **loop-global**. The container records the *previous* default executor (if any) and the fact that *it* installed one, so `aclose()` can restore the prior state instead of blindly clearing it. In a single-process API this is mostly defensive, but it makes the container safe to create/destroy repeatedly inside one test session (which the leak tests do).
+> `loop.set_default_executor()` changes a **loop-global**. The container records the fact that *it* installed one (`_installed_executor`). It does **not** try to reset the loop default on teardown — asyncio has no public way to clear it (`set_default_executor(None)` raises `TypeError` on 3.11+), and a failed reset must never strand the redis/engine steps. This is safe to create/destroy repeatedly inside one test session because the next `create()`'s `install_default_executor()` overwrites the default; the unit leak test drives the `_installed_executor=True` path to prove teardown completes regardless.
 
 ### 5.3 Boundary enforcement: `core/` and `container.py` never import FastAPI
 
@@ -457,7 +457,7 @@ class AppContainer:
     object_store: ObjectStore
     queue: JobQueue
     providers: ProviderBundle
-    # Bookkeeping so aclose() can restore the loop's prior default executor.
+    # Bookkeeping: whether create() installed our executor as the loop default.
     _installed_executor: bool = field(default=False, repr=False)
 
     # ------------------------------------------------------------------ #
@@ -575,13 +575,15 @@ class AppContainer:
         except Exception:  # pragma: no cover - defensive
             logger.exception("executor shutdown failed")
         finally:
-            if self._installed_executor:
-                # Restore the loop default so a re-created container is clean.
-                try:
-                    asyncio.get_running_loop().set_default_executor(None)  # type: ignore[arg-type]
-                except RuntimeError:
-                    pass  # loop already closed during shutdown
-                self._installed_executor = False
+            # We installed this executor as the loop's default in create().
+            # asyncio offers NO public way to *clear* a default executor:
+            # set_default_executor(None) raises TypeError on 3.11+ (and Phase 2
+            # forbids that call). We do NOT attempt it — aclose() is terminal in
+            # the API/worker (the loop closes next), and a re-created container's
+            # install_default_executor() overwrites the default. Clearing the
+            # flag keeps aclose() idempotent and lets the redis + engine steps
+            # below ALWAYS run (a failed reset must never strand teardown).
+            self._installed_executor = False
 
         # 2) Redis connection pool.
         try:
@@ -629,7 +631,7 @@ def _build_s3_client(s: ObjectStoreSettings) -> "S3Client":
 - **Deferred SDK imports (in Phase 4's `build_providers`).** The `from huggingface_hub import …` / `from pinecone import …` live *inside* the `if`-branches of `build_providers` (Phase 4 `bundle.py`). A fakes-only run (the default) never imports `huggingface_hub` or `pinecone`, keeping cold start fast and CI hermetic — zero accidental network at import time. The container simply calls `build_providers(settings, offloader)`.
 - **`ensure_bucket()` only when `not settings.is_prod`.** Auto-creating buckets in production is a footgun (it can mask a misconfigured bucket name). In dev/test it's pure convenience so the demo works on a fresh MinIO.
 - **`aclose()` ordering & guarding.** Reverse order (executor → redis → engine). Each step is wrapped so a failure is *logged* and the next step still runs — a single stuck Redis socket must not prevent `engine.dispose()`. `cancel_futures=True` discards queued offload tasks that never started; threads already running are allowed to finish (Python doesn't force-kill threads).
-- **`set_default_executor(None)` restore.** After we shut our executor down, leaving it installed as the loop default would make later `to_thread` calls fail. Resetting to `None` lets asyncio lazily create a fresh default if anything else needs one (relevant only when a test creates several containers on one loop).
+- **No `set_default_executor(None)` reset.** asyncio has no public way to *clear* a loop's default executor: `set_default_executor(None)` raises `TypeError` on Python 3.11+ (it demands a `ThreadPoolExecutor`), and a naïve `except RuntimeError` would let that `TypeError` escape the `finally` and **skip the redis/engine teardown — leaking both**. So `aclose()` does not attempt the reset. This is safe because `aclose()` is terminal in the API/worker (the loop is closed next), and a re-created container's `install_default_executor()` overwrites the default. We only clear the `_installed_executor` flag (idempotency). The unit leak test exercises the `_installed_executor=True` path to prove teardown still completes.
 
 > [!IMPORTANT]
 > `ThreadPoolExecutor.shutdown(cancel_futures=...)` requires **Python 3.9+**; the project targets 3.12+, so it's safe. The `wait=False` is deliberate: `aclose()` runs on the event loop and must not *block the loop thread* waiting on worker threads. Queued tasks are cancelled; in-flight tasks drain in the background and the GC reclaims the pool once they finish.
@@ -2039,7 +2041,7 @@ The composition root runs on the developer's machine (Windows, per this repo) *a
 | `422` on a payload you think is valid | `extra="forbid"` rejected an unexpected key, or `job_type` tag misspelled | Check the `errors` array in the 422 body; match field names and the `job_type` literal exactly. |
 | `FastAPI(lifespan=...)` never runs startup | Passed `lifespan()` (called) instead of `lifespan` (the function) | Pass the function object uncalled: `FastAPI(lifespan=_make_lifespan(...))`. |
 | Engine connections leak (`checkedout()` stays > 0) | A handler opened `container.session_factory()` without an `async with`, or the repository skipped its `async with session_factory()` | Repository methods are session-per-operation (`async with` each call); a handler needing a raw session (readiness probe) must also use `async with`. |
-| `RuntimeError: cannot schedule new futures after shutdown` mid-test | A second `create()` ran on a loop whose default executor was a shut-down pool | `aclose()` restores `set_default_executor(None)`; ensure your fixture closes the prior container before creating another on the same loop. |
+| `RuntimeError: cannot schedule new futures after shutdown` mid-test | A second `create()` ran on a loop whose default executor was a shut-down pool, or code offloaded after `aclose()` | The next `create()`'s `install_default_executor()` replaces the shut-down pool; ensure your fixture closes the prior container *before* the next `create()` on the same loop and does not `to_thread` in between. |
 | `huggingface_hub`/`pinecone` import error in CI | A provider key leaked into the CI env → real adapter import path taken | Keep provider keys unset in CI; deferred imports mean fakes never import the SDKs. |
 | Readiness `503` with `postgres: ok=False` | DB unreachable or wrong `AIE_DATABASE_URL` | Confirm infra is up (`docker compose ps`), the async driver prefix (`postgresql+asyncpg://`), and migrations ran. |
 | `POST /v1/jobs` is slow (hundreds of ms) | Pipeline work leaked into the route, or publish retry is actually sleeping | Confirm no provider in the route; in tests set `base_delay_s=0`. In prod the retry only sleeps *on failure*. |
