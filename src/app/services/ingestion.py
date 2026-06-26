@@ -47,7 +47,23 @@ class IngestionService:
         await self._repository.add(job)
 
         # 2) Publish a pointer, NOT the payload. PG is the source of truth.
-        #    Wrap in retry: a transient Redis blip must not 500 the client.
+        #    Wrap in retry: a transient Redis blip must not 500 the client. The
+        #    adapter (StreamProducer) translates raw redis errors into
+        #    Transient/PermanentUpstreamError, so this loop retries only genuine
+        #    transients (see app.adapters.broker._errors.classify_redis_error).
+        #
+        #    Orphaned-PENDING decision: if publish ultimately fails (retries
+        #    exhausted, or a permanent error), the upstream error propagates and
+        #    the row is DELIBERATELY left PENDING. We do NOT mark it FAILED here:
+        #      * the domain state machine has no PENDING->FAILED edge (only
+        #        RUNNING->FAILED) — forging one would widen a locked invariant for
+        #        a path that never executed the job;
+        #      * the client gets a 5xx and never received the job_id, so there is
+        #        no row to poll — the orphan is inert (no stream pointer exists, so
+        #        no worker will ever touch it) and harmless to leave;
+        #      * reaping stale PENDING rows is an operational concern, intentionally
+        #        out of scope here (no reaper subsystem).
+        #    Asserted by tests/unit/api/test_ingestion_retry.py.
         async for attempt in retrying(self._retry):
             with attempt:
                 await self._queue.publish(job)
