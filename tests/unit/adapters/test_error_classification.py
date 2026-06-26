@@ -13,7 +13,19 @@ import httpx
 import pytest
 from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
 from huggingface_hub.errors import HfHubHTTPError, InferenceTimeoutError
+from redis.exceptions import (
+    AuthenticationError,
+    AuthenticationWrongNumberOfArgsError,
+    BusyLoadingError,
+    DataError,
+    OutOfMemoryError,
+    ResponseError,
+    TryAgainError,
+)
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from app.adapters.broker._errors import classify_redis_error
 from app.adapters.object_store.errors import classify_botocore_error
 from app.adapters.providers._errors import (
     classify_ddgs_error,
@@ -48,6 +60,36 @@ def _ce(code: str, status: int) -> ClientError:
 )
 def test_classify_botocore_error(exc: Exception, expected: type[Exception]) -> None:
     result = classify_botocore_error(exc)
+    assert isinstance(result, expected)
+    assert result.__cause__ is exc  # original cause preserved for tracebacks
+
+
+# ---- redis (broker) classifier --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        # Connection-layer / timeout / cluster-retry signals -> transient.
+        (RedisConnectionError("reset by peer"), TransientUpstreamError),
+        (RedisTimeoutError("command timed out"), TransientUpstreamError),
+        (BusyLoadingError("loading dataset in memory"), TransientUpstreamError),
+        (TryAgainError("TRYAGAIN"), TransientUpstreamError),
+        # Auth failures are permanent — and AuthenticationError is a *subclass of
+        # ConnectionError*, so this row proves the guard order (it must NOT be
+        # swept up as a transient connection blip).
+        (AuthenticationError("WRONGPASS"), PermanentUpstreamError),
+        (AuthenticationWrongNumberOfArgsError("bad AUTH args"), PermanentUpstreamError),
+        # Other protocol / server-state ResponseErrors -> permanent.
+        (ResponseError("WRONGTYPE Operation against a key"), PermanentUpstreamError),
+        (OutOfMemoryError("OOM command not allowed"), PermanentUpstreamError),
+        (DataError("Invalid input"), PermanentUpstreamError),
+        # Non-redis exception -> permanent (fail safe, don't retry the unknown).
+        (ValueError("not a redis error"), PermanentUpstreamError),
+    ],
+)
+def test_classify_redis_error(exc: Exception, expected: type[Exception]) -> None:
+    result = classify_redis_error(exc)
     assert isinstance(result, expected)
     assert result.__cause__ is exc  # original cause preserved for tracebacks
 

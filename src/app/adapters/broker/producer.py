@@ -10,8 +10,9 @@ from typing import Any
 
 import structlog
 from redis.asyncio import Redis
-from redis.exceptions import ResponseError
+from redis.exceptions import RedisError, ResponseError
 
+from app.adapters.broker._errors import classify_redis_error
 from app.adapters.broker.keys import BrokerKeys
 from app.adapters.broker.messages import JobMessage
 from app.core.config import BrokerSettings
@@ -62,22 +63,13 @@ class StreamProducer:
         ingestion path.
         """
         message = JobMessage.first_delivery(job)
-        # Widen to dict[Any, Any]: redis-py's xadd `fields` is an *invariant*
-        # union-keyed dict, so a dict[str, str] is rejected despite str being a
-        # valid member. The wider local annotation satisfies the signature.
-        fields: dict[Any, Any] = message.to_fields()
-        message_id = await self._redis.xadd(
-            name=self._keys.stream,
-            fields=fields,
-            maxlen=self._maxlen,
-            approximate=True,  # the "~" modifier; cheap trimming
-        )
+        decoded = await self._xadd(self._keys.stream, message.to_fields())
         log.info(
             "broker.published",
             job_id=str(job.id),
             job_type=job.job_type.value,
             attempt=message.attempt,
-            message_id=_decode_id(message_id),
+            message_id=decoded,
             stream=self._keys.stream,
         )
 
@@ -88,14 +80,7 @@ class StreamProducer:
         retry path already owns a :class:`JobMessage` with the right attempt and
         must NOT reset it to 1.
         """
-        fields: dict[Any, Any] = message.to_fields()
-        message_id = await self._redis.xadd(
-            name=self._keys.stream,
-            fields=fields,
-            maxlen=self._maxlen,
-            approximate=True,
-        )
-        return _decode_id(message_id)
+        return await self._xadd(self._keys.stream, message.to_fields())
 
     async def dead_letter(self, message: JobMessage, reason: str) -> str:
         """Append a poison pointer to the DLQ stream, with a failure reason.
@@ -103,14 +88,7 @@ class StreamProducer:
         The DLQ is just another stream, trimmed like the main one so it cannot
         grow without bound.
         """
-        fields: dict[Any, Any] = {**message.to_fields(), "reason": reason}
-        message_id = await self._redis.xadd(
-            name=self._keys.dlq,
-            fields=fields,
-            maxlen=self._maxlen,
-            approximate=True,
-        )
-        decoded = _decode_id(message_id)
+        decoded = await self._xadd(self._keys.dlq, {**message.to_fields(), "reason": reason})
         log.warning(
             "broker.dead_lettered",
             job_id=str(message.job_id),
@@ -120,6 +98,33 @@ class StreamProducer:
             message_id=decoded,
         )
         return decoded
+
+    async def _xadd(self, stream: str, fields: dict[Any, Any]) -> str:
+        """``XADD`` with an approximate MAXLEN trim, translating raw redis errors.
+
+        All three publish paths funnel through here so a transient redis failure
+        (connection reset, timeout, server loading) is translated into
+        ``TransientUpstreamError`` — which the ingestion retry policy and the
+        broker both retry — instead of escaping as a raw ``redis.exceptions.*``
+        that the retry predicate ignores and that would 500 the client. Permanent
+        redis errors (auth, protocol) become ``PermanentUpstreamError`` so they
+        fail fast rather than being retried blindly. Mirrors how ``S3ObjectStore``
+        funnels every boto3 call through ``classify_botocore_error``.
+
+        ``fields`` is widened to ``dict[Any, Any]`` because redis-py's ``xadd``
+        types ``fields`` as an *invariant* union-keyed dict, which rejects a
+        ``dict[str, str]`` despite ``str`` being a valid member.
+        """
+        try:
+            message_id = await self._redis.xadd(
+                name=stream,
+                fields=fields,
+                maxlen=self._maxlen,
+                approximate=True,  # the "~" modifier; cheap trimming
+            )
+        except RedisError as exc:
+            raise classify_redis_error(exc) from exc
+        return _decode_id(message_id)
 
 
 def _decode_id(message_id: object) -> str:
