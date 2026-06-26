@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Greenfield — planned, not yet implemented.** The repo currently contains only `README.md` and the two design documents below. There is no source code, `pyproject.toml`, or tests yet. The first implementation work is Phase 1 of the plan.
+**Implemented (Phases 1-9 complete).** The full engine described in the design docs exists and is wired up: `pyproject.toml` (uv-managed, src layout) plus source under `src/app/` (`core/`, `domain/`, `ports/`, `adapters/`, `services/`, `api/`, `worker/`, a shared `container.py` composition root), `migrations/` (async alembic), Docker/compose, CI, and a `tests/` tree (`unit/`, `integration/`, `support/`). The **unit suite passes with zero network/Docker** (sqlite via `aiosqlite`, `fakeredis.aioredis`, in-process fakes) under `ruff` + `mypy --strict`; integration tests are gated behind the `integration` marker and require live Postgres/Redis/MinIO.
+
+Treat the design docs as the rationale of record, and keep them in sync when behavior changes:
 
 - `Docs/problem-statement.md` — the authoritative spec (an **Asynchronous AI Serving Engine** built on Hexagonal / Ports & Adapters principles; a portfolio/interview-facing project).
-- `Docs/implementation-plan.md` — the authoritative, phase-by-phase build plan. **Read this before writing any code.** Architectural decisions, the repo layout, dependency list, and per-phase verify steps all live there; keep it and the code in sync.
+- `Docs/implementation-plan.md` — the phase-by-phase build plan. Architectural decisions, the repo layout, dependency list, and per-phase verify steps all live there; keep it and the code in sync.
 
 The rest of this file summarizes the locked decisions so you don't have to re-derive them. When in doubt, the two `Docs/` files win.
 

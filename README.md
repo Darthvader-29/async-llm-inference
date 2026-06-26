@@ -1,7 +1,6 @@
-<!-- Replace <owner> below with the real GitHub owner once the repo is pushed. -->
 # Asynchronous AI Serving Engine
 
-[![CI](https://github.com/<owner>/async-llm-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/async-llm-inference/actions/workflows/ci.yml)
+[![CI](https://github.com/Darthvader-29/async-llm-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/Darthvader-29/async-llm-inference/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![Typed](https://img.shields.io/badge/typed-mypy--strict-success)
 ![Lint](https://img.shields.io/badge/lint-ruff-orange)

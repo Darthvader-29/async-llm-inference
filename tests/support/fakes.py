@@ -1,10 +1,22 @@
-"""Stub fakes for the ports — *shapes only*.
+"""In-process test doubles for the ports — injected throughout the unit suite.
 
-These minimal in-memory implementations exist so Phase 2 can type-check
-conformance and later phases have a stable import target. The behavior-rich
-deterministic fakes (seeded embeddings, cosine vector store, templated LLM,
-canned search) are implemented in Phase 4 — see
-``Docs/phases/phase-4-object-store-providers.md``.
+Two flavours live here, both structurally conforming to their port Protocol
+(no inheritance; mypy --strict checks conformance at the injection site):
+
+* **Behaviour-rich doubles** that the write-path/broker/container tests depend
+  on: ``InMemoryRepository`` / ``FakeJobRepository`` (dict-backed; ``get`` raises
+  the real ``JobNotFound`` contract), ``FakeJobQueue`` / ``FakeQueue`` (record
+  published jobs; ``FakeQueue`` can simulate N transient publish failures to
+  drive retry deterministically), and ``FakeObjectStore`` (dict-backed bucket).
+* **Minimal deterministic provider stubs** (``StubEmbeddingProvider``,
+  ``StubLLMProvider``, ``StubVectorStore``, ``StubSearchProvider``) — fixed-shape
+  stand-ins used where a test only needs a conforming provider, not realistic
+  output. The production-grade deterministic provider fakes (seeded embeddings,
+  cosine vector store, templated LLM, canned search) live with the real adapters
+  in ``src/app/adapters/providers/fake.py`` and are selected by the all-fakes
+  bundle — this module does NOT duplicate them.
+
+Everything is clock-free and zero-dependency (no network, no Docker).
 """
 
 from __future__ import annotations
@@ -19,7 +31,11 @@ from app.ports import SearchResult, VectorMatch
 
 @dataclass(slots=True)
 class FakeJobRepository:
-    """In-memory ``JobRepository`` stub (shape only; expanded in later phases)."""
+    """In-memory ``JobRepository`` double (dict-backed; ``get`` raises ``KeyError``).
+
+    The lifecycle/wiring tests that use it never hit the missing-row path;
+    ``InMemoryRepository`` below is the variant that raises the real ``JobNotFound``.
+    """
 
     _store: dict[UUID, InferenceJob] = field(default_factory=dict)
 
@@ -106,11 +122,11 @@ class StubSearchProvider:
 
 
 # ---------------------------------------------------------------------------
-# Phase 6 additions — behaviour-rich fakes for the ingestion write-path tests.
-# Public attributes (``store`` / ``published``) so tests can assert on what was
-# persisted/published; ``get`` raises ``JobNotFound`` (the real port contract);
-# ``FakeQueue`` can be told to fail transiently N times to exercise publish
-# retry deterministically (no clocks).
+# Behaviour-rich doubles for the ingestion write-path tests. Public attributes
+# (``store`` / ``published``) let tests assert on what was persisted/published;
+# ``get`` raises ``JobNotFound`` (the real port contract); ``FakeQueue`` can be
+# told to fail transiently N times to exercise publish retry deterministically
+# (counted, never timed — no clocks).
 # ---------------------------------------------------------------------------
 class FakeQueue:
     """Records published jobs; can be told to fail transiently N times."""
